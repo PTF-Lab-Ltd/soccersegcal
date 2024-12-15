@@ -1,11 +1,11 @@
-tqdm
-wandb
+
 vi3o
+<<<<<<< HEAD
 opencv-python
 shapely
 pytorch3d
 pytorch-lightning
 fire
+=======
+>>>>>>> d0a6fd9 (Fixed requirements again)
 SoccerNet>=0.1.23
-scipy
-matplotlib
