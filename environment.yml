@@ -1,0 +1,14 @@
+name: segcal
+channels:
+  - https://repo.anaconda.com/pkgs/main
+  - https://repo.anaconda.com/pkgs/r
+dependencies:
+  - python=3.9
+  - pytorch-cuda=11.6
+  - pytorch=1.13.0
+  - torchvision
+  - iopath
+  - fvcore
+  - pytorch3d
+  - pytorch-lightning
+prefix: /home/anna/miniconda3/envs/segcal
