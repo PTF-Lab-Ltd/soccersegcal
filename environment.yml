@@ -7,8 +7,12 @@ dependencies:
   - pytorch-cuda=11.6
   - pytorch=1.13.0
   - torchvision
-  - iopath
-  - fvcore
-  - pytorch3d
+  - fire
+  - matplotlib
+  - opencv
   - pytorch-lightning
-prefix: /home/anna/miniconda3/envs/segcal
+  - pytorch3d
+  - scipy
+  - shapely
+  - tqdm
+  - wandb
