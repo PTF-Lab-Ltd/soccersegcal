@@ -1,4 +1,4 @@
-from dataloader import SoccerNetFieldSegmentationDataset, pview
+from dataloader import SoccerNetFieldSegmentationDataset
 from sncalib.soccerpitch import SoccerPitch
 from sncalib.baseline_cameras import Camera
 from sncalib.camera import pan_tilt_roll_to_orientation, rotation_matrix_to_pan_tilt_roll
@@ -409,6 +409,7 @@ class ModelPanTiltRollDistorted(ModelPanTiltRoll):
 
 def move_camera(meshes, segs, cam, world_scale, direction='pan'):
     model = Model(meshes, segs, cam).to('cuda')
+    data = SoccerNetFieldSegmentationDataset(width=256)
     with torch.no_grad():
         while True:
             for t in chain(range(100), range(100, 0, -1)):
@@ -428,7 +429,7 @@ def move_camera(meshes, segs, cam, world_scale, direction='pan'):
                     raise NotImplementedError
                 loss, image = model()
                 image_view = image[:3] + image[3:]
-                pview(image_view, pause=True)
+                data.save_visualization(entry, index)
 
 def optimize_camera(meshes, segs, cam, max_itter=10000, max_no_improve=10000, min_loss=0.001, roll=False, distort=False, show=True, modes=None, seg_indexes=None, lr=0.001):
     if modes is None:
@@ -470,16 +471,8 @@ def optimize_camera(meshes, segs, cam, max_itter=10000, max_no_improve=10000, mi
             converged = True
             break
 
-        if show:
-            image_view = image[:3] + image[3:]
-            segs_view = segs[:3] + segs[3:]
-            pview(image_view, pause=False)
-            pview(segs_view, pause=False)
-            pview(segs_view.to('cuda')-image_view, pause=False)
-            # from vi3o.debugview import DebugViewer
-            # out.view(imscale(np.hstack([a[0] for a in DebugViewer.named_viewers['Default'].image_array]), (720, 134)))
 
-            flipp() #pause=True)
+            # flipp() #pause=True)
 
     return loss, model, converged
 
@@ -616,7 +609,7 @@ def show_camera_view():
         self = ModelPanTiltRoll(meshes, segs, state_dict).to('cuda')
         loss, image = self()
         image_view = image[:3, :, :] + image[3:, :, :]
-        pview(image_view, pause=True); flipp()
+        # pview(image_view, pause=True); flipp()
 
 
 def count_x_in_order(centers, order):
