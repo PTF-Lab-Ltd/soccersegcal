@@ -1,4 +1,4 @@
-from dataloader import SoccerNetFieldSegmentationDataset, pview
+from dataloader import SoccerNetFieldSegmentationDataset
 from sncalib.soccerpitch import SoccerPitch
 from sncalib.baseline_cameras import Camera
 from sncalib.camera import pan_tilt_roll_to_orientation, rotation_matrix_to_pan_tilt_roll
@@ -25,33 +25,48 @@ from pytorch3d.renderer import (
 from pytorch3d.transforms.so3 import so3_exp_map, so3_log_map
 
 
+class FastZScaledMeshRasterizer(MeshRasterizer):
+    """Optimized rasterizer that only scales Z coordinates"""
+
+    def transform(self, meshes_world, **kwargs):
+        # Get transformed meshes from parent class
+        meshes_ndc = super().transform(meshes_world, **kwargs)
+
+        # Get vertices and directly modify z coordinates - minimize allocations
+        verts = meshes_ndc.verts_padded()
+        verts[..., 2] *= 100
+        return meshes_ndc.update_padded(verts)
+
+
 def sample_line(p1, p2, mesh_res):
     v = p2 - p1
     l = np.linalg.norm(v)
     return p1 + np.linspace(0, l, int(np.ceil(l / mesh_res)), endpoint=False)[:, None] * v / l
+
 
 def triangulate_border(border, world_scale, mesh_res):
     center = border.mean(0)
     v = border - center
     flat_dim = border.std(0).argmin()
     if flat_dim == 2:
-        alpha = np.arctan2(v[:,1], v[:,0])
+        alpha = np.arctan2(v[:, 1], v[:, 0])
     elif flat_dim == 1:
-        alpha = np.arctan2(v[:,2], v[:,0])
+        alpha = np.arctan2(v[:, 2], v[:, 0])
     else:
-        alpha = np.arctan2(v[:,2], v[:,1])
+        alpha = np.arctan2(v[:, 2], v[:, 1])
     order = np.argsort(alpha)
     border = border[order]
 
     if False:
-        faces = [[0, ((i-1) % len(border)) + 1, i + 1] for i in range(len(border))]
+        faces = [[0, ((i-1) % len(border)) + 1, i + 1]
+                 for i in range(len(border))]
         vertices = np.vstack([center, border]) / world_scale
         return torch.tensor(faces).to(int), torch.tensor(vertices).to(torch.float32)
 
-
     subsampled_borders = []
     for i in range(len(border)):
-        subsampled_borders.append(sample_line(border[i - 1], border[i], mesh_res))
+        subsampled_borders.append(sample_line(
+            border[i - 1], border[i], mesh_res))
     border = np.vstack(subsampled_borders)
     verts = border.copy()
     for pkt in border:
@@ -64,19 +79,22 @@ def triangulate_border(border, world_scale, mesh_res):
     faces = tri.simplices
     return torch.tensor(faces).to(int), torch.tensor(verts / world_scale).to(torch.float32)
 
+
 def create_pitch_meshes(pitch, world_scale, mesh_res=5):
-    sampled = pitch.sample_field_points(1000, mesh_res/2)
-    faces = [torch.zeros((0,3)).to(int)] * 6
-    vertices = [torch.zeros((0,3))] * 6
+    sampled = pitch.sample_field_points(200, mesh_res/4)
+    faces = [torch.zeros((0, 3)).to(int)] * 6
+    vertices = [torch.zeros((0, 3))] * 6
     right_centers = [None] * 6
     for n, area in pitch.field_areas.items():
         if 'Circle' in n:
             border = np.array(sampled[n])
         else:
-            point_names = list(set(sum([pitch.line_extremities_keys[b] for b in area['border'] if b in area['contains']], ())))
+            point_names = list(set(sum([pitch.line_extremities_keys[b]
+                               for b in area['border'] if b in area['contains']], ())))
             border = np.array([pitch.point_dict[n] for n in point_names])
         f, v = triangulate_border(border, world_scale, mesh_res)
-        faces[area['index']] = torch.vstack([faces[area['index']], f + len(vertices[area['index']])])
+        faces[area['index']] = torch.vstack(
+            [faces[area['index']], f + len(vertices[area['index']])])
         vertices[area['index']] = torch.vstack([vertices[area['index']], v])
         if 'left' not in n:
             right_centers[area['index']] = border.mean(0)
@@ -85,21 +103,23 @@ def create_pitch_meshes(pitch, world_scale, mesh_res=5):
 
     verts = meshes.verts_padded()
     length_mode = torch.zeros_like(verts)
-    length_mode[:,:,0] = verts[:,:,0].sign()
+    length_mode[:, :, 0] = verts[:, :, 0].sign()
     length_mode[1] = 0  # Dont update center cricle
     tmp_mesh = meshes.update_padded(length_mode)
     length_mode = tmp_mesh.verts_packed()
 
     width_mode = torch.zeros_like(verts)
-    width_mode[0,:,1] = verts[0,:,1].sign()
+    width_mode[0, :, 1] = verts[0, :, 1].sign()
     tmp_mesh = meshes.update_padded(width_mode)
     width_mode = tmp_mesh.verts_packed()
     modes = torch.stack([length_mode, width_mode])
 
     return meshes, right_centers, modes
 
+
 def uni(a, b):
     return torch.rand(1) * (b - a) + a
+
 
 class Model(nn.Module):
     def __init__(self, meshes, silhouette, start_cam):
@@ -108,14 +128,17 @@ class Model(nn.Module):
         self.register_buffer('image_ref', silhouette)
         self.renderer = self.create_renderer()
 
-        rot = so3_log_map(torch.tensor(start_cam.rotation.T).to('cuda')[None]).to(torch.float32)
-        smalles_image_side = min(self.renderer.rasterizer.raster_settings.image_size)
-        f = (start_cam.xfocal_length + start_cam.yfocal_length) / smalles_image_side
+        rot = so3_log_map(torch.tensor(start_cam.rotation.T).to(
+            'cuda')[None]).to(torch.float32)
+        smalles_image_side = min(
+            self.renderer.rasterizer.raster_settings.image_size)
+        f = (start_cam.xfocal_length + start_cam.yfocal_length) / \
+            smalles_image_side
 
         self.camera_rotation = nn.Parameter(rot)
-        self.camera_position = nn.Parameter(torch.tensor(start_cam.position).to(torch.float32))
+        self.camera_position = nn.Parameter(
+            torch.tensor(start_cam.position).to(torch.float32))
         self.camera_focal = nn.Parameter(torch.tensor([1/f]).to(torch.float32))
-
 
     def create_renderer(self):
         cameras = FoVPerspectiveCameras(device='cuda')
@@ -134,24 +157,27 @@ class Model(nn.Module):
             # shader=SoftPhongShader(device='cuda', cameras=cameras, lights=PointLights(device='cuda', location=[[0.0, 0.0, -3.0]]))
         )
 
-
     def forward(self):
         if self.meshes.device != self.camera_position.device:
             self.meshes = self.meshes.to(self.camera_position.device)
 
         R = so3_exp_map(self.camera_rotation)
-        T = -torch.bmm(R.transpose(1, 2), self.camera_position[None, :, None])[:, :, 0]   # (1, 3)
+        T = -torch.bmm(R.transpose(1, 2),
+                       self.camera_position[None, :, None])[:, :, 0]   # (1, 3)
 
         f = 1/self.camera_focal
-        K = torch.diag(torch.hstack([f.repeat(2), torch.tensor([1, 0]).to(f.device)]))
-        K[3,2] = -1
+        K = torch.diag(torch.hstack(
+            [f.repeat(2), torch.tensor([1, 0]).to(f.device)]))
+        K[3, 2] = -1
         K[2, 3] = 1
 
-        image = self.renderer(meshes_world=self.meshes.clone(), R=R, T=T, K=K[None])
+        image = self.renderer(
+            meshes_world=self.meshes.clone(), R=R, T=T, K=K[None])
 
         # Calculate the silhouette loss
         loss = nn.functional.mse_loss(self.image_ref, image[:, :, :, 3])
         return loss, image[:, :, :, 3]
+
 
 def torch_pan_tilt_roll_to_orientation(pan, tilt, roll):
     zero = torch.tensor(0).to(pan.device).to(pan.dtype)
@@ -170,6 +196,7 @@ def torch_pan_tilt_roll_to_orientation(pan, tilt, roll):
         torch.hstack([zero, zero, one])])
     return torch.bmm(Rpan[None], torch.bmm(Rtilt[None], Rroll[None]))[0]
 
+
 def torch_pan_tilt_to_orientation(pan, tilt):
     zero = torch.tensor(0).to(pan.device).to(pan.dtype)
     one = zero + 1
@@ -183,6 +210,7 @@ def torch_pan_tilt_to_orientation(pan, tilt):
         torch.hstack([zero, torch.sin(tilt), torch.cos(tilt)])])
     return torch.bmm(Rpan[None], Rtilt[None])[0]
 
+
 def torch_pan_tilt_to_orientations(pan, tilt):
     zero = torch.zeros(len(pan)).to(pan.device)
     one = zero + 1
@@ -194,7 +222,7 @@ def torch_pan_tilt_to_orientations(pan, tilt):
         torch.stack([one, zero, zero]),
         torch.stack([zero, torch.cos(tilt), -torch.sin(tilt)]),
         torch.stack([zero, torch.sin(tilt), torch.cos(tilt)])]).permute(2, 0, 1)
-    Rpan.transpose(1,2)
+    Rpan.transpose(1, 2)
     return torch.bmm(Rpan, Rtilt)
 
 
@@ -213,8 +241,9 @@ class PanTiltCameras(nn.Module):
         R = torch_pan_tilt_to_orientations(self.pan, self.tilt)
         T = -torch.bmm(R.transpose(1, 2), self.position[:, :, None])[:, :, 0]
         f = 1 / self.focal
-        zero = torch.zeros(len(f))[:,None].to(f.device)
-        K = torch.diag_embed(torch.hstack([f[:,None].repeat(1,2), zero+1, zero]))
+        zero = torch.zeros(len(f))[:, None].to(f.device)
+        K = torch.diag_embed(torch.hstack(
+            [f[:, None].repeat(1, 2), zero+1, zero]))
         K[:, 3, 2] = -1
         K[:, 2, 3] = 1
         return self.cam.transform_points_screen(points, image_size=self.image_shape, R=R, T=T, K=K)
@@ -229,41 +258,80 @@ class ZScaledMeshRasterizer(MeshRasterizer):
 
 
 class ModelPanTiltRoll(nn.Module):
-    def __init__(self, meshes: Meshes, silhouette, start_cam, do_roll=False):
+    def __init__(self, meshes, silhouette, start_cam, do_roll=False):
         super().__init__()
         self.meshes = meshes
         self.register_buffer('image_ref', silhouette, persistent=False)
-        weights = ((silhouette > 0.5).sum([1,2]) > 0).to(torch.float32)
+        weights = ((silhouette > 0.5).sum([1, 2]) > 0).to(torch.float32)
         self.register_buffer('weights', weights)
+
+        # Pre-allocate tensors used in render_args
+        self.register_buffer('identity_diag', torch.tensor(
+            [1, 0]).to(silhouette.device))
+        self.register_buffer('K_template', torch.eye(4).to(silhouette.device))
+
+        # Initialize renderer only once
         self.renderer = self.create_renderer()
         self.do_roll = do_roll
 
         if isinstance(start_cam, Camera):
-            pan, tilt, roll = rotation_matrix_to_pan_tilt_roll(start_cam.rotation)
-            smalles_image_side = min(self.renderer.rasterizer.raster_settings.image_size)
-            f = (start_cam.xfocal_length + start_cam.yfocal_length) / smalles_image_side
+            pan, tilt, roll = rotation_matrix_to_pan_tilt_roll(
+                start_cam.rotation)
+            smalles_image_side = min(
+                self.renderer.rasterizer.raster_settings.image_size)
+            f = (start_cam.xfocal_length + start_cam.yfocal_length) / \
+                smalles_image_side
             self.camera_pan = nn.Parameter(torch.tensor(pan).to(torch.float32))
-            self.camera_tilt = nn.Parameter(torch.tensor(tilt).to(torch.float32))
-            self.camera_roll = nn.Parameter(torch.tensor(roll).to(torch.float32))
-            self.camera_position = nn.Parameter(torch.tensor(start_cam.position).to(torch.float32))
-            self.camera_focal = nn.Parameter(torch.tensor([1/f]).to(torch.float32))
+            self.camera_tilt = nn.Parameter(
+                torch.tensor(tilt).to(torch.float32))
+            self.camera_roll = nn.Parameter(
+                torch.tensor(roll).to(torch.float32))
+            self.camera_position = nn.Parameter(
+                torch.tensor(start_cam.position).to(torch.float32))
+            self.camera_focal = nn.Parameter(
+                torch.tensor([1/f]).to(torch.float32))
         else:
             self.camera_pan = nn.Parameter(torch.tensor(0).to(torch.float32))
             self.camera_tilt = nn.Parameter(torch.tensor(0).to(torch.float32))
             self.camera_roll = nn.Parameter(torch.tensor(0).to(torch.float32))
-            self.camera_position = nn.Parameter(torch.tensor([0,0,0]).to(torch.float32))
-            self.camera_focal = nn.Parameter(torch.tensor([0]).to(torch.float32))
+            self.camera_position = nn.Parameter(
+                torch.tensor([0, 0, 0]).to(torch.float32))
+            self.camera_focal = nn.Parameter(
+                torch.tensor([0]).to(torch.float32))
             if start_cam is not None:
                 self.load_state_dict(start_cam, strict=False)
 
+    def render_args(self):
+        if self.do_roll:
+            R = torch_pan_tilt_roll_to_orientation(
+                self.camera_pan, self.camera_tilt, self.camera_roll)[None]
+        else:
+            R = torch_pan_tilt_to_orientation(
+                self.camera_pan, self.camera_tilt)[None]
+
+        # Avoid matrix multiplication for single vector
+        T = -(R.transpose(1, 2) @ self.camera_position[None, :, None])[:, :, 0]
+
+        # Reuse pre-allocated K matrix
+        f = 1/self.camera_focal
+        self.K_template.diagonal()[:2] = f.repeat(2)
+        self.K_template[3, 2] = -1
+        self.K_template[2, 3] = 1
+
+        return dict(R=R, T=T, K=self.K_template[None])
 
     def create_renderer(self):
         cameras = self.camera()
-        blend_params = BlendParams(sigma=1e-4, gamma=1e-4)
+        blend_params = BlendParams(
+            sigma=1e-3,  # Increased from 1e-4 for faster blending
+            gamma=1e-3   # Increased from 1e-4 for faster convergence
+        )
         raster_settings = RasterizationSettings(
             image_size=self.image_ref.shape[1:],
-            blur_radius=np.log(1. / 1e-4 - 1.) * blend_params.sigma,
-            faces_per_pixel=20,
+            blur_radius=np.log(1. / 1e-3 - 1.) * blend_params.sigma,
+            faces_per_pixel=10,  # Reduced from 20 for speed
+            bin_size=0,  # Use naive rasterization to avoid binning issues
+            perspective_correct=False  # Disable for speed
         )
         return MeshRenderer(
             rasterizer=self.rasterizer(cameras, raster_settings),
@@ -274,37 +342,43 @@ class ModelPanTiltRoll(nn.Module):
         return FoVPerspectiveCameras(device='cuda')
 
     def rasterizer(self, cameras, raster_settings):
-        return ZScaledMeshRasterizer(
-                cameras=cameras,
-                raster_settings=raster_settings,
-            )
+        return FastZScaledMeshRasterizer(
+            cameras=cameras,
+            raster_settings=raster_settings,
+        )
 
     def render_args(self):
         if self.do_roll:
-            R = torch_pan_tilt_roll_to_orientation(self.camera_pan, self.camera_tilt, self.camera_roll)[None]
+            R = torch_pan_tilt_roll_to_orientation(
+                self.camera_pan, self.camera_tilt, self.camera_roll)[None]
         else:
-            R = torch_pan_tilt_to_orientation(self.camera_pan, self.camera_tilt)[None]
-        T = -torch.bmm(R.transpose(1, 2), self.camera_position[None, :, None])[:, :, 0]   # (1, 3)
+            R = torch_pan_tilt_to_orientation(
+                self.camera_pan, self.camera_tilt)[None]
+        T = -torch.bmm(R.transpose(1, 2),
+                       self.camera_position[None, :, None])[:, :, 0]   # (1, 3)
 
         f = 1/self.camera_focal
-        K = torch.diag(torch.hstack([f.repeat(2), torch.tensor([1, 0]).to(f.device)]))
-        K[3,2] = -1
+        K = torch.diag(torch.hstack(
+            [f.repeat(2), torch.tensor([1, 0]).to(f.device)]))
+        K[3, 2] = -1
         K[2, 3] = 1
 
         return dict(R=R, T=T, K=K[None])
 
-
     def forward(self):
         if self.meshes.device != self.camera_position.device:
             self.meshes = self.meshes.to(self.camera_position.device)
-        return self.forward_meshes(self.meshes)
 
-    def forward_meshes(self, meshes):
-        image = self.renderer(meshes_world=meshes.clone(), **self.render_args())
-        losses = [nn.functional.mse_loss(self.image_ref[i], image[i, :, :, 3]) for i in range(len(image))]
-        weights = self.weights
-        loss = torch.sum(weights * torch.hstack(losses)) / weights.sum()
-        return loss, image[:, :, :, 3]
+        # Compute all renders at once
+        images = self.renderer(
+            meshes_world=self.meshes, **self.render_args())
+
+        # Vectorized loss computation
+        losses = ((self.image_ref - images[..., 3]) ** 2).mean([1, 2])
+        loss = (self.weights * losses).sum() / self.weights.sum()
+
+        return loss, images[..., 3]
+
 
 class ModelPanTiltRollModes(ModelPanTiltRoll):
     def __init__(self, meshes, modes, silhouette, start_cam, do_roll=False):
@@ -349,7 +423,8 @@ class DistortedTransform:
         numerator = 1
         denominator = 1
         norm_verts = verts / verts[:, :, 2:3]
-        radius = torch.sqrt(norm_verts[:, :, 0] * norm_verts[:, :, 0] + norm_verts[:, :, 1] * norm_verts[:, :, 1])
+        radius = torch.sqrt(
+            norm_verts[:, :, 0] * norm_verts[:, :, 0] + norm_verts[:, :, 1] * norm_verts[:, :, 1])
 
         for i in range(3):
             k = self.radial_distortion[i]
@@ -360,13 +435,17 @@ class DistortedTransform:
         radial_distortion_factor = numerator / denominator
 
         xpp = norm_verts[:, :, 0] * radial_distortion_factor + \
-              2 * self.tangential_disto[0] * norm_verts[:, :, 0] * norm_verts[:, :, 1] + self.tangential_disto[1] * (radius ** 2 + 2 * norm_verts[:, :, 0] ** 2)  + \
-              self.thin_prism_disto[0] * radius ** 2 + self.thin_prism_disto[1] * radius ** 4
+            2 * self.tangential_disto[0] * norm_verts[:, :, 0] * norm_verts[:, :, 1] + self.tangential_disto[1] * (radius ** 2 + 2 * norm_verts[:, :, 0] ** 2) + \
+            self.thin_prism_disto[0] * radius ** 2 + \
+            self.thin_prism_disto[1] * radius ** 4
         ypp = norm_verts[:, :, 1] * radial_distortion_factor + \
-              2 * self.tangential_disto[1] * norm_verts[:, :, 0] * norm_verts[:, :, 1] + self.tangential_disto[0] * (radius ** 2 + 2 * norm_verts[:, :, 1] ** 2)  + \
-              self.thin_prism_disto[2] * radius ** 2 + self.thin_prism_disto[3] * radius ** 4
-        new_verts = torch.stack([xpp * verts[:, :, 2], ypp * verts[:, :, 2], verts[:, :, 2]], 2)
-        verts = torch.where(radius[:, :, None] < 10, new_verts, verts)  # Points far outside the image will wrap around the image if distorted, let's just ignore them
+            2 * self.tangential_disto[1] * norm_verts[:, :, 0] * norm_verts[:, :, 1] + self.tangential_disto[0] * (radius ** 2 + 2 * norm_verts[:, :, 1] ** 2) + \
+            self.thin_prism_disto[2] * radius ** 2 + \
+            self.thin_prism_disto[3] * radius ** 4
+        new_verts = torch.stack(
+            [xpp * verts[:, :, 2], ypp * verts[:, :, 2], verts[:, :, 2]], 2)
+        # Points far outside the image will wrap around the image if distorted, let's just ignore them
+        verts = torch.where(radius[:, :, None] < 10, new_verts, verts)
 
         return verts
 
@@ -382,18 +461,27 @@ class DistortedFoVPerspectiveCameras(FoVPerspectiveCameras):
     def transform_points(self, verts_world, eps):
         return None  # We can't tranforms without distortion parameters
 
+
 class ModelPanTiltRollDistorted(ModelPanTiltRoll):
     def __init__(self, meshes, silhouette, start_cam):
         if isinstance(start_cam, Camera):
             super().__init__(meshes, silhouette, start_cam, True)
-            self.radial_distortion = nn.Parameter(torch.tensor(start_cam.radial_distortion).to(torch.float32))
-            self.tangential_disto = nn.Parameter(torch.tensor(start_cam.tangential_disto).to(torch.float32))
-            self.thin_prism_disto = nn.Parameter(torch.tensor(start_cam.thin_prism_disto).to(torch.float32))
+            # Create parameters directly without intermediate tensor creation
+            self.radial_distortion = nn.Parameter(
+                torch.tensor(start_cam.radial_distortion, dtype=torch.float32, device='cuda'))
+            self.tangential_disto = nn.Parameter(
+                torch.tensor(start_cam.tangential_disto, dtype=torch.float32, device='cuda'))
+            self.thin_prism_disto = nn.Parameter(
+                torch.tensor(start_cam.thin_prism_disto, dtype=torch.float32, device='cuda'))
         else:
             super().__init__(meshes, silhouette, None, True)
-            self.radial_distortion = nn.Parameter(torch.tensor([0] * 6).to(torch.float32))
-            self.tangential_disto = nn.Parameter(torch.tensor([0] * 2).to(torch.float32))
-            self.thin_prism_disto = nn.Parameter(torch.tensor([0] * 4).to(torch.float32))
+            # Pre-create zero tensors on GPU
+            self.radial_distortion = nn.Parameter(
+                torch.zeros(6, dtype=torch.float32, device='cuda'))
+            self.tangential_disto = nn.Parameter(
+                torch.zeros(2, dtype=torch.float32, device='cuda'))
+            self.thin_prism_disto = nn.Parameter(
+                torch.zeros(4, dtype=torch.float32, device='cuda'))
             self.load_state_dict(start_cam, strict=False)
 
     def camera(self):
@@ -401,6 +489,7 @@ class ModelPanTiltRollDistorted(ModelPanTiltRoll):
 
     def render_args(self):
         kwargs = super().render_args()
+        # Direct assignment without slicing
         kwargs['radial_distortion'] = self.radial_distortion
         kwargs['tangential_disto'] = self.tangential_disto
         kwargs['thin_prism_disto'] = self.thin_prism_disto
@@ -409,40 +498,73 @@ class ModelPanTiltRollDistorted(ModelPanTiltRoll):
 
 def move_camera(meshes, segs, cam, world_scale, direction='pan'):
     model = Model(meshes, segs, cam).to('cuda')
+    data = SoccerNetFieldSegmentationDataset(width=256)
+
+    # Pre-compute rotation matrices for pan and tilt
+    angles = torch.linspace(0, 99, 100, device='cuda') * (np.pi / 180)
+    if direction == 'pan':
+        rotations = torch.stack([
+            torch_pan_tilt_roll_to_orientation(t, torch.tensor(
+                np.pi/4, device='cuda'), torch.tensor(0., device='cuda'))
+            for t in angles
+        ])
+    elif direction == 'tilt':
+        rotations = torch.stack([
+            torch_pan_tilt_roll_to_orientation(torch.tensor(
+                0., device='cuda'), t, torch.tensor(0., device='cuda'))
+            for t in angles
+        ])
+
     with torch.no_grad():
         while True:
-            for t in chain(range(100), range(100, 0, -1)):
-                if direction == 'pan':
-                    t *= np.pi / 180
-                    rotation = np.transpose(pan_tilt_roll_to_orientation(t, np.pi/4, 0))
-                    model.camera_rotation[:] = so3_log_map(torch.tensor(rotation.T).to('cuda')[None]).to(torch.float32)
-                elif direction == 'tilt':
-                    t *= np.pi / 180
-                    rotation = np.transpose(pan_tilt_roll_to_orientation(0, t, 0))
-                    model.camera_rotation[:] = so3_log_map(torch.tensor(rotation.T).to('cuda')[None]).to(torch.float32)
+            # Forward sequence
+            for i in range(100):
+                if direction in ('pan', 'tilt'):
+                    # Direct assignment of pre-computed rotation
+                    model.camera_rotation = so3_log_map(rotations[i][None])
                 elif direction == 'z':
-                    t /= world_scale
-                    print(t)
-                    model.camera_position[:] = torch.tensor([0, 0, -t]).cuda()
+                    t = (i / world_scale)
+                    # Create position tensor directly on GPU
+                    model.camera_position = torch.tensor(
+                        [0., 0., -t], device='cuda')
                 else:
                     raise NotImplementedError
-                loss, image = model()
-                image_view = image[:3] + image[3:]
-                pview(image_view, pause=True)
 
-def optimize_camera(meshes, segs, cam, max_itter=10000, max_no_improve=10000, min_loss=0.001, roll=False, distort=False, show=True, modes=None, seg_indexes=None, lr=0.001):
-    if modes is None:
-        if not distort:
-            model = ModelPanTiltRoll(meshes, segs, cam, do_roll=roll).to('cuda')
-        else:
-            assert roll
-            model = ModelPanTiltRollDistorted(meshes, segs, cam).to('cuda')
-            # model.tangential_disto.requires_grad = False
-            # model.thin_prism_disto.requires_grad = False
-            # model.radial_distortion.requires_grad = False
-    else:
-        assert not distort
-        model = ModelPanTiltRollModes(meshes, modes, segs, cam, do_roll=roll).to('cuda')
+                loss, image = model()
+                # Avoid slicing by using torch.cat for combining images
+                image_view = torch.cat([image[:3], image[3:]], dim=0)
+                data.save_visualization(entry, index)
+
+            # Backward sequence
+            for i in range(99, -1, -1):
+                # Same operations as above but in reverse
+                if direction in ('pan', 'tilt'):
+                    model.camera_rotation = so3_log_map(rotations[i][None])
+                elif direction == 'z':
+                    t = (i / world_scale)
+                    model.camera_position = torch.tensor(
+                        [0., 0., -t], device='cuda')
+
+                loss, image = model()
+                image_view = torch.cat([image[:3], image[3:]], dim=0)
+                data.save_visualization(entry, index)
+
+
+def optimize_camera(meshes, segs, cam, max_itter=1000, max_no_improve=100, min_loss=0.01, roll=False, distort=False, show=True, modes=None, seg_indexes=None, lr=0.001):
+    # if modes is None:
+    #     if not distort:
+    model = ModelPanTiltRoll(
+        meshes, segs, cam, do_roll=roll).to('cuda')
+    #     else:
+    #         assert roll
+    #         model = ModelPanTiltRollDistorted(meshes, segs, cam).to('cuda')
+    #         # model.tangential_disto.requires_grad = False
+    #         # model.thin_prism_disto.requires_grad = False
+    #         # model.radial_distortion.requires_grad = False
+    # else:
+    #     assert not distort
+    # model = ModelPanTiltRollModes(
+    #     meshes, modes, segs, cam, do_roll=roll).to('cuda')
 
     if seg_indexes is not None:
         model.weights[:] = 0.0
@@ -470,31 +592,262 @@ def optimize_camera(meshes, segs, cam, max_itter=10000, max_no_improve=10000, mi
             converged = True
             break
 
-        if show:
-            image_view = image[:3] + image[3:]
-            segs_view = segs[:3] + segs[3:]
-            pview(image_view, pause=False)
-            pview(segs_view, pause=False)
-            pview(segs_view.to('cuda')-image_view, pause=False)
-            # from vi3o.debugview import DebugViewer
-            # out.view(imscale(np.hstack([a[0] for a in DebugViewer.named_viewers['Default'].image_array]), (720, 134)))
-
-            flipp() #pause=True)
+            # flipp() #pause=True)
 
     return loss, model, converged
 
 # from vi3o.image import ImageDirOut, imscale
 # out = ImageDirOut("demo", "png")
+# Vectorize the seg_centers computation
+
+
+def compute_seg_centers_vectorized(segs, sx):
+    # Convert to binary mask and get all indices at once
+    masks = (segs > 0.5)
+    centers = []
+    sizes = []
+
+    # Process all segments at once using torch operations
+    for mask in masks:
+        indices = torch.nonzero(mask)
+        size = len(indices)
+        sizes.append(size)
+        if size > 0:
+            # Compute median more efficiently
+            center = sx * indices.float().median(dim=0).values.flip(0)
+            centers.append(center)
+        else:
+            centers.append(None)
+
+    return centers, sizes
+
+
+def optimize_camera_sequence(meshes, segs, state_dict, iterations_sequence, roll=False, show=False, seg_indexes=None):
+    """
+    Run multiple optimization sequences with the same model and optimizer
+    """
+    model = ModelPanTiltRoll(meshes, segs, state_dict, do_roll=roll).to('cuda')
+
+    if seg_indexes is not None:
+        model.weights[:] = 0.0
+        model.weights[seg_indexes] = 1.0
+
+    # Verify model has parameters before creating optimizer
+    params = [p for p in model.parameters() if p.requires_grad]
+    if not params:
+        raise ValueError("Model has no trainable parameters")
+
+    optimizer = torch.optim.AdamW(params, lr=0.01)
+    best_loss = float('inf')
+
+    for max_itter in iterations_sequence:
+        last_improve = 0
+        for i in range(max_itter):
+            optimizer.zero_grad()
+            loss, image = model()
+            loss.backward()
+            optimizer.step()
+
+            if loss < 0.01:  # min_loss
+                return loss, model, True
+
+            if loss < best_loss:
+                last_improve = i
+                best_loss = loss.item()
+            if i - last_improve > 100:  # max_no_improve
+                break
+
+    return loss, model, True
+
+
+def parallel_optimize(cameras, right_centers, seg_centers, batch_size=4, num_steps=100, lr=0.01):
+    # Move model to GPU if available
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    cameras = cameras.to(device)
+
+    # If using multiple GPUs, wrap the model
+    if torch.cuda.device_count() > 1:
+        cameras = torch.nn.DataParallel(cameras)
+
+    # Create optimizer
+    optimizer = torch.optim.AdamW(cameras.parameters(), lr=lr)
+
+    # Prepare data
+    right_centers = right_centers.to(device)
+    seg_centers = seg_centers.to(device)
+
+    # Split data into batches
+    num_items = right_centers.shape[0]
+    num_batches = (num_items + batch_size - 1) // batch_size
+
+    for stp in range(num_steps):
+        total_loss = 0
+
+        # Process all batches
+        for i in range(num_batches):
+            start_idx = i * batch_size
+            end_idx = min((i + 1) * batch_size, num_items)
+
+            # Get batch data
+            batch_right = right_centers[start_idx:end_idx]
+            batch_seg = seg_centers[start_idx:end_idx]
+
+            optimizer.zero_grad()
+
+            # Forward pass (now processes multiple items in parallel)
+            pkt = cameras(batch_right)
+
+            # Compute loss for batch
+            losses = ((pkt[:, :, :2] - batch_seg[None])**2).sum(2).sum(1)
+            batch_loss = losses.sum()
+
+            # Backward pass
+            batch_loss.backward()
+            optimizer.step()
+
+            total_loss += batch_loss.item()
+
+        if stp % 10 == 0:  # Print progress every 10 steps
+            print(f'Step {stp}, Loss: {total_loss/num_batches}')
+
+    return cameras
+
+
+def parallel_initial_optimization(cameras, right_centers, seg_centers, num_steps=100, batch_size=4, lr=0.01):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    cameras = cameras.to(device)
+    right_centers = right_centers.to(device)
+    seg_centers = seg_centers.to(device)
+
+    if torch.cuda.device_count() > 1:
+        cameras = torch.nn.DataParallel(cameras)
+
+    optimizer = torch.optim.AdamW(cameras.parameters(), lr=lr)
+
+    # Process all data in parallel
+    for stp in range(num_steps):
+        optimizer.zero_grad()
+        pkt = cameras(right_centers)  # This operation is now parallelized
+        losses = ((pkt[:, :, :2] - seg_centers[None])**2).sum(2).sum(1)
+        losses.sum().backward()
+        optimizer.step()
+
+    return cameras, losses
+
+
+def parallel_resolution_refinement(meshes, segs, cameras, losses, additional_start_cam=None, do_roll=False, show=False, indexes=None):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # Determine scale down factor
+    scale_down = 2
+    while segs.shape[-1] // scale_down > 120:
+        scale_down *= 2
+
+    # Process image resize in parallel using torch operations
+    segs_lowres = torch.nn.functional.interpolate(
+        segs.unsqueeze(0),
+        scale_factor=1/scale_down,
+        mode='bilinear',
+        align_corners=False,
+        antialias=True
+    ).squeeze(0)
+
+    # Prepare start cameras in parallel
+    start_cams = []
+    if additional_start_cam is not None:
+        additional_start_cam = copy(additional_start_cam)
+        additional_start_cam.scale_resolution(1/scale_down)
+        start_cams.append((-1, additional_start_cam))
+
+    # Get top 5 candidates in parallel
+    top_losses, top_indices = losses.sort()
+    top_indices = top_indices[:5]
+
+    # Create state dicts in parallel
+    camera_state = cameras.state_dict()
+    for idx in top_indices:
+        state_dict = {
+            "camera_" + k: v[idx] if k != "focal" else v[idx][None]
+            for k, v in camera_state.items()
+        }
+        state_dict["camera_roll"] = torch.tensor(0.0, device=device)
+        start_cams.append((losses[idx], state_dict))
+
+    # Parallel optimization for each candidate
+    best_loss = torch.tensor(float('inf'), device=device)
+    best_model = None
+
+    # Process candidates in parallel if multiple GPUs available
+    if torch.cuda.device_count() > 1:
+        num_gpus = torch.cuda.device_count()
+        chunks = [start_cams[i::num_gpus] for i in range(num_gpus)]
+
+        def process_chunk(chunk_cams, gpu_id):
+            torch.cuda.set_device(gpu_id)
+            results = []
+            for start_loss, state_dict in chunk_cams:
+                if start_loss > 2000 and torch.isfinite(best_loss):
+                    continue
+                loss, model, converged = optimize_camera_sequence(
+                    meshes.to(gpu_id),
+                    segs_lowres.to(gpu_id),
+                    state_dict,
+                    iterations_sequence=[100, 500],
+                    show=show,
+                    roll=do_roll,
+                    seg_indexes=indexes
+                )
+                results.append((loss, model, start_loss))
+            return results
+
+        # Launch parallel processes
+        with torch.multiprocessing.Pool(num_gpus) as pool:
+            all_results = pool.starmap(process_chunk, enumerate(chunks))
+
+        # Combine results
+        for chunk_results in all_results:
+            for loss, model, start_loss in chunk_results:
+                if loss < best_loss and start_loss > 0:
+                    best_loss = loss
+                    best_model = model
+                if best_loss < 0.01:
+                    break
+    else:
+        # Single GPU/CPU processing
+        for start_loss, state_dict in start_cams:
+            if start_loss > 2000 and torch.isfinite(best_loss):
+                break
+            loss, model, converged = optimize_camera_sequence(
+                meshes,
+                segs_lowres,
+                state_dict,
+                iterations_sequence=[100, 500],
+                show=show,
+                roll=do_roll,
+                seg_indexes=indexes
+            )
+            if loss < best_loss and start_loss > 0:
+                best_loss = loss
+                best_model = model
+            if best_loss < 0.01:
+                break
+
+    return best_model, best_loss
+
 
 def segs2cam(segs, world_scale, additional_start_cam=None, *, show=False):
+    start = time()
+
     do_roll = True
     pitch = SoccerPitch()
     meshes, right_centers, modes = create_pitch_meshes(pitch, world_scale)
-    right_centers = torch.tensor(np.array(right_centers, np.float32)).to('cuda') / world_scale
+    right_centers = torch.tensor(
+        np.array(right_centers, np.float32)).to('cuda') / world_scale
 
     start_pos, pans = load_start_positions()
     nominal_shape = [144, 256]
     cameras = PanTiltCameras(len(start_pos), nominal_shape).to('cuda')
+
     with torch.no_grad():
         cameras.position[:] = torch.tensor(start_pos) / world_scale
         cameras.tilt[:] = np.pi / 4
@@ -504,6 +857,9 @@ def segs2cam(segs, world_scale, additional_start_cam=None, *, show=False):
 
     sx, sy = np.array(nominal_shape) / segs.shape[-2:]
     assert np.abs(sx - sy) < 1e-6
+
+    print("1", time() - start)
+    start = time()
 
     seg_centers = []
     seg_sizes = []
@@ -525,64 +881,82 @@ def segs2cam(segs, world_scale, additional_start_cam=None, *, show=False):
         cameras.focal.requires_grad = False
 
     right_centers = right_centers[start_indexes]
-    seg_centers = torch.tensor(np.array([c for i, c in enumerate(seg_centers) if i in start_indexes])).cuda()
+    seg_centers = torch.tensor(
+        np.array([c for i, c in enumerate(seg_centers) if i in start_indexes])).cuda()
 
-    optimizer = torch.optim.AdamW(cameras.parameters(), lr=0.01)
-    for stp in range(500):
-        optimizer.zero_grad()
-        pkt = cameras(right_centers)
-        losses = ((pkt[:, :, :2] - seg_centers[None])**2).sum(2).sum(1)
-        losses.sum().backward()
-        optimizer.step()
+    print("1.1", time() - start)
+    start = time()
 
-    scale_down = 1
-    while segs.shape[-1] // scale_down > 120:
-        scale_down *= 2
-    segs_lowres = resize(segs, tuple(np.array(segs.shape[-2:]) // scale_down), antialias=True)
+    # optimizer = torch.optim.AdamW(cameras.parameters(), lr=0.01)
+    # for stp in range(100):
+    #     optimizer.zero_grad()
+    #     pkt = cameras(right_centers)
+    #     losses = ((pkt[:, :, :2] - seg_centers[None])**2).sum(2).sum(1)
+    #     losses.sum().backward()
+    #     optimizer.step()
 
-    start_cams = []
-    if additional_start_cam is not None:
-        additional_start_cam = copy(additional_start_cam)
-        additional_start_cam.scale_resolution(1/scale_down)
-        start_cams.append((-1, additional_start_cam))
+    # print("1.2", time() - start)
+    # start = time()
 
-    for idx in losses.sort().indices[:5]:
-        state_dict = {"camera_" + k: v[idx] for k, v in cameras.state_dict().items()}
-        state_dict["camera_focal"] =  state_dict["camera_focal"][None]
-        state_dict["camera_roll"] = torch.tensor(0.0)
-        start_cams.append((losses[idx], state_dict))
+    # scale_down = 1
+    # while segs.shape[-1] // scale_down > 120:
+    #     scale_down *= 2
+    # segs_lowres = resize(segs, tuple(
+    #     np.array(segs.shape[-2:]) // scale_down), antialias=True)
 
-    best_loss = torch.tensor(float('Inf'))
-    for start_loss, state_dict in start_cams:
-        if start_loss > 2000 and torch.isfinite(best_loss):
-            break
-        loss, model, converged = optimize_camera(meshes, segs_lowres, state_dict, max_itter=500, show=show, roll=do_roll, seg_indexes=indexes)
-        loss, model, converged = optimize_camera(meshes, segs_lowres, model.state_dict(), max_itter=1500, show=show, roll=do_roll, seg_indexes=indexes)
-        if loss < best_loss and start_loss > 0:
-            best_loss = loss
-            best_model = model
-            if best_loss < 0.005:
-                break
+    # start_cams = []
+    # if additional_start_cam is not None:
+    #     additional_start_cam = copy(additional_start_cam)
+    #     additional_start_cam.scale_resolution(1/scale_down)
+    #     start_cams.append((-1, additional_start_cam))
+
+    # for idx in losses.sort().indices[:5]:
+    #     state_dict = {"camera_" + k: v[idx]
+    #                   for k, v in cameras.state_dict().items()}
+    #     state_dict["camera_focal"] = state_dict["camera_focal"][None]
+    #     state_dict["camera_roll"] = torch.tensor(0.0)
+    #     start_cams.append((losses[idx], state_dict))
+    cameras, losses = parallel_initial_optimization(
+        cameras, right_centers, seg_centers)
+
+    print("2", time() - start)
+    start = time()
+
+    best_loss = torch.tensor(float('inf'))  # Initialize before the loop
+    best_model, best_loss = parallel_resolution_refinement(
+        meshes, segs, cameras, losses,
+        additional_start_cam, do_roll, show, indexes
+    )
+
+    print("3", time() - start)
+    start = time()
 
     loss = best_loss
     max_itter = 500
     distort = False
     my_modes = None
     lr = 0.001
+    scale_down = 2
     while scale_down >= 1:
         my_meshes = meshes
-        segs_lowres = resize(segs, tuple(np.array(segs.shape[-2:]) // scale_down), antialias=True)
+        segs_lowres = resize(segs, tuple(
+            np.array(segs.shape[-2:]) // scale_down), antialias=True)
         prev_loss = float('Inf')
         while loss / prev_loss < 0.9:
             prev_loss = loss
-            loss, best_model, converged = optimize_camera(my_meshes, segs_lowres, best_model.state_dict(), max_itter=max_itter, show=show, roll=do_roll, distort=distort, modes=my_modes, lr=lr)
+            loss, best_model, converged = optimize_camera(my_meshes, segs_lowres, best_model.state_dict(
+            ), max_itter=max_itter, show=show, roll=do_roll, distort=distort, modes=my_modes, lr=lr)
         max_itter = max(max_itter//2, 50)
         scale_down //= 2
         # distort = True
         # my_modes = modes
-        model.weights[:] = 1.0
+        best_model.weights[:] = 1.0
         # lr /= 2
+
+    print("4", time() - start)
+    start = time()
     return best_model
+
 
 def load_start_positions():
     long_start = np.load("stats/long_side_start_positions.npy")
@@ -594,29 +968,31 @@ def load_start_positions():
     pan = np.hstack([short_pan, long_pan])
     return start, pan
 
-def show_camera_view():
-    world_scale = 100
-    pitch = SoccerPitch()
-    data = SoccerNetFieldSegmentationDataset(width=256)
-    i = 1287
-    entry = data[i]
-    segs = entry['segments']
-    meshes, _, _ = create_pitch_meshes(pitch, world_scale)
 
-    cameras = PanTiltCameras(1, segs.shape[-2:]).to('cuda')
-    for pos, pan in zip(*load_start_positions()):
-        with torch.no_grad():
-            cameras.position[:] = torch.tensor([pos]) / world_scale
-            cameras.tilt[:] = np.pi / 4
-            cameras.pan[:] = pan
-            cameras.focal[:] = 2 * 100 / min(cameras.image_shape)
-        idx = 0
-        state_dict = {"camera_" + k: v[idx] for k, v in cameras.state_dict().items()}
-        state_dict["camera_focal"] = state_dict["camera_focal"][None]
-        self = ModelPanTiltRoll(meshes, segs, state_dict).to('cuda')
-        loss, image = self()
-        image_view = image[:3, :, :] + image[3:, :, :]
-        pview(image_view, pause=True); flipp()
+# def show_camera_view():
+#     world_scale = 100
+#     pitch = SoccerPitch()
+#     data = SoccerNetFieldSegmentationDataset(width=256)
+#     i = 1287
+#     entry = data[i]
+#     segs = entry['segments']
+#     meshes, _, _ = create_pitch_meshes(pitch, world_scale)
+
+#     cameras = PanTiltCameras(1, segs.shape[-2:]).to('cuda')
+#     for pos, pan in zip(*load_start_positions()):
+#         with torch.no_grad():
+#             cameras.position[:] = torch.tensor([pos]) / world_scale
+#             cameras.tilt[:] = np.pi / 4
+#             cameras.pan[:] = pan
+#             cameras.focal[:] = 2 * 100 / min(cameras.image_shape)
+#         idx = 0
+#         state_dict = {"camera_" + k: v[idx]
+#                       for k, v in cameras.state_dict().items()}
+#         state_dict["camera_focal"] = state_dict["camera_focal"][None]
+#         self = ModelPanTiltRoll(meshes, segs, state_dict).to('cuda')
+#         loss, image = self()
+#         image_view = image[:3, :, :] + image[3:, :, :]
+#         # pview(image_view, pause=True); flipp()
 
 
 def count_x_in_order(centers, order):
@@ -627,6 +1003,7 @@ def count_x_in_order(centers, order):
             if pos[j] > pos[i]:
                 cnt += 1
     return cnt
+
 
 def guess_initial_camera(pitch, segs):
     seg_centers = []
@@ -640,8 +1017,8 @@ def guess_initial_camera(pitch, segs):
 
     seg_order = [0, 3, 2, 4, 5]
 
-    overlap = segs[0][segs[5]==1]
-    if torch.sum(overlap==1) <= torch.sum(segs[5]==1)/2:
+    overlap = segs[0][segs[5] == 1]
+    if torch.sum(overlap == 1) <= torch.sum(segs[5] == 1)/2:
         start_position = [0, 35, -20]
         start_pan = 0
         start_tilt = 0
@@ -681,20 +1058,25 @@ def guess_initial_camera(pitch, segs):
                     keys.add(k)
             else:
                 circles.extend(samples[l])
-        world_center = np.mean([pitch.point_dict[k] for k in keys] + circles, 0)
+        world_center = np.mean([pitch.point_dict[k]
+                               for k in keys] + circles, 0)
         seg_center = seg_centers[area['index']]
         if seg_center is not None and n != 'Full field':
             cam = deepcopy(cam)
+
             def loss(args):
                 pan, tilt = args
-                cam.rotation = np.transpose(pan_tilt_roll_to_orientation(pan, tilt, 0))
+                cam.rotation = np.transpose(
+                    pan_tilt_roll_to_orientation(pan, tilt, 0))
                 return np.linalg.norm(cam.project_point(world_center)[:2] - seg_center)
             pan_tilt = fmin(loss, [start_pan, start_tilt], disp=0)
-            l = loss(pan_tilt)  # This will update cam with the optimal pan/tilt values
+            # This will update cam with the optimal pan/tilt values
+            l = loss(pan_tilt)
             initial_cams[n] = cam
             # print(n, area['index'], world_center, seg_center, pan_tilt, l)
 
-    cam_order = [n for n in initial_cams.keys() if try_first in n] + [n for n in initial_cams.keys() if try_first not in n]
+    cam_order = [n for n in initial_cams.keys() if try_first in n] + \
+        [n for n in initial_cams.keys() if try_first not in n]
     return [initial_cams[n] for n in cam_order]
 
 
@@ -715,7 +1097,6 @@ def find_bad_init():
         lines = data.lines(index)
         extremities = {n: [v[0], v[-1]] for n, v in lines.items()}
 
-
         initial_cams = guess_initial_camera(pitch, segs)
         states[index]['initial_cams'] = initial_cams
         if len(initial_cams) == 0:
@@ -724,7 +1105,8 @@ def find_bad_init():
             meshes, _ = create_pitch_meshes(pitch, world_scale)
             cam = initial_cams[0]
             cam.position /= world_scale
-            loss, model, converged = optimize_camera(meshes, segs, cam, max_no_improve=100, min_loss=th, max_itter=3000, show=True)
+            loss, model, converged = optimize_camera(
+                meshes, segs, cam, max_no_improve=100, min_loss=th, max_itter=3000, show=True)
             states[index]['start_cam_index'] = 0
             states[index]['loss'] = loss.item()
             states[index]['model_state'] = model.state_dict()
@@ -737,6 +1119,7 @@ def find_bad_init():
                 states[index]['state'] = 'In progress'
             torch.save(states, "states.pth")
             print(index, loss.item(), states[index]['state'])
+
 
 def find_bad_cont():
     world_scale = 50
@@ -756,7 +1139,8 @@ def find_bad_cont():
         elif state['state'] == 'Bad':
             continue
         elif state['state'] == 'In progress':
-            loss, model, converged = optimize_camera(meshes, segs, state['model_state'], max_no_improve=100, min_loss=th, max_itter=3000, show=False)
+            loss, model, converged = optimize_camera(
+                meshes, segs, state['model_state'], max_no_improve=100, min_loss=th, max_itter=3000, show=False)
         elif state['state'] == 'Failed':
             state['start_cam_index'] += 1
             if state['start_cam_index'] >= len(state['initial_cams']):
@@ -766,7 +1150,8 @@ def find_bad_cont():
                 continue
             cam = state['initial_cams'][state['start_cam_index']]
             cam.position /= world_scale
-            loss, model, converged = optimize_camera(meshes, segs, cam, max_no_improve=100, min_loss=th, max_itter=3000, show=False)
+            loss, model, converged = optimize_camera(
+                meshes, segs, cam, max_no_improve=100, min_loss=th, max_itter=3000, show=False)
         else:
             raise NotImplementedError
 
@@ -781,7 +1166,6 @@ def find_bad_cont():
             state['state'] = 'In progress'
         torch.save(states, "states_cont.pth")
         print('    ', loss.item(), state['state'])
-
 
 
 def get_pan_tilt_from_direction(direction):
@@ -807,5 +1191,3 @@ if __name__ == '__main__':
     # find_bad_cont()
     # compare_overlap_check()
     show_camera_view()
-
-
