@@ -1,0 +1,4 @@
+[submodule "soccernet-calibration"]
+	path = soccernet-calibration
+	url = git@github.com:PTF-Lab-Ltd/soccernet-calibration.git
+	branch = main

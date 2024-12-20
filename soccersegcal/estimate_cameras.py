@@ -1,7 +1,7 @@
 from soccersegcal.dataloader import SoccerNetFieldSegmentationDataset, save_seg_vis
 from soccersegcal.pose import segs2cam
 import torch
-from sncalib.baseline_cameras import Camera
+from soccernet_calibration.baseline_cameras import Camera
 import numpy as np
 from pathlib import Path
 import json
